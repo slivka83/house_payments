@@ -1,9 +1,17 @@
 __pycache__/
 *.pyc
 .venv/
-data/
+
+# в data/ попадают кэши и квитанции: в гит — только структура папок с .gitkeep
+data/*
+!data/receipts/
+data/receipts/**
+!data/receipts/**/
+!data/receipts/**/.gitkeep
+
 *.csv
 *.json
+*.sqlite*
 .env
 !requirements.txt
 !.env.example

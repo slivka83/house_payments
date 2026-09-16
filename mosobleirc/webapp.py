@@ -10,24 +10,25 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .client import MosOblEIRCClient, MosOblEIRCError
 from .stats import (
+    FALLBACK_GROUP,
+    GROUP_ORDER,
     VALUE_FIELDS,
-    ReceiptCache,
     aggregate,
-    collect_charges,
+    canonical_service_group,
+    charge_from_dict,
     collect_receipt_charges,
-    has_category_history,
+    find_supplier_receipt,
     month_range,
     pdf_support_available,
-    previous_month,
+    supplier_label,
 )
-from .tokens import load_token, save_token
+from .store import Store
 
 BUILD = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime())
 
@@ -140,13 +141,13 @@ button.primary { background: var(--accent); border-color: var(--accent); color: 
   padding: 16px;
   margin-bottom: 16px;
 }
-.chart-box { position: relative; height: 460px; }
-.chart-box.small { height: 320px; }
+.chart-box { position: relative; height: 460px; min-height: 320px; }
 .table-scroll { overflow-x: auto; }
 table { border-collapse: collapse; width: 100%; font-size: 13px; }
 th, td { padding: 8px 10px; text-align: right; white-space: nowrap; }
 .month-link { color: inherit; text-decoration: none; border-bottom: 1px dashed var(--muted); }
 .month-link:hover { color: var(--accent); border-color: var(--accent); }
+.service-supplier { display: block; font-size: 11px; color: var(--muted); font-weight: 400; }
 th:first-child, td:first-child { text-align: left; }
 thead th { color: var(--muted); font-weight: 600; border-bottom: 1px solid var(--border); }
 tbody tr:nth-child(even) { background: color-mix(in srgb, var(--border) 30%, transparent); }
@@ -218,7 +219,7 @@ tfoot td { font-weight: 700; border-top: 1px solid var(--border); }
   font-size: 12px;
   font-weight: 400;
   line-height: 1.35;
-  white-space: normal;
+  white-space: pre-line;
   text-align: left;
   opacity: 0;
   pointer-events: none;
@@ -258,10 +259,12 @@ tfoot td { font-weight: 700; border-top: 1px solid var(--border); }
       <select id="months">
         <option value="6">6 месяцев</option>
         <option value="12" selected>12 месяцев</option>
+        <option value="18">18 месяцев</option>
         <option value="24">24 месяца</option>
+        <option value="30">30 месяцев</option>
         <option value="36">36 месяцев</option>
       </select>
-      <button id="reload" class="primary icon-button" type="button" title="Обновить из ЛКК" aria-label="Обновить из ЛКК">
+      <button id="reload" class="primary icon-button" type="button" title="Пересканировать папки" aria-label="Пересканировать папки">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
           <path d="M21 12a9 9 0 1 1-2.64-6.36"/>
           <polyline points="21 3 21 9 15 9"/>
@@ -337,18 +340,35 @@ function monthTitle(items) {
   return month ? formatMonth(month) : '';
 }
 
-function receiptUrl(month) {
-  return '/api/receipt_pdf?month=' + encodeURIComponent(month);
+function receiptUrl(month, supplier) {
+  let url = '/api/receipt_pdf?month=' + encodeURIComponent(month);
+  if (supplier) url += '&supplier=' + encodeURIComponent(supplier);
+  return url;
 }
 
-function monthLink(month) {
-  return '<a class="month-link" href="' + receiptUrl(month) + '" target="_blank" rel="noopener" title="Открыть квитанцию">'
+function serviceSupplierKey(service) {
+  const map = (payload && payload.categories && payload.categories.supplierKeys) || {};
+  const keys = map[service] || [];
+  return keys.length === 1 ? keys[0] : null;
+}
+
+function monthLink(month, service) {
+  const supplier = service ? serviceSupplierKey(service) : null;
+  return '<a class="month-link" href="' + receiptUrl(month, supplier) + '" target="_blank" rel="noopener" title="Открыть квитанцию">'
     + formatMonth(month) + '</a>';
 }
 
-function openReceipt(month) {
+function openReceipt(month, supplier) {
   if (!month) return;
-  window.open(receiptUrl(month), '_blank', 'noopener');
+  window.open(receiptUrl(month, supplier), '_blank', 'noopener');
+}
+
+function chartService(chart, element) {
+  const value = (payload.categories && payload.categories.value) || 'charged';
+  if (value === 'volume') return selectedService;
+  if (chart.config.type === 'doughnut') return chart.data.labels[element.index] || null;
+  const dataset = chart.data.datasets[element.datasetIndex];
+  return (dataset && dataset.label) || null;
 }
 
 function monthFromChart(event, chart) {
@@ -368,11 +388,14 @@ const chartReceiptOptions = {
   onClick: (event, elements, chart) => {
     const months = (payload.categories && payload.categories.months) || [];
     let month = null;
+    let supplier = null;
     if (elements && elements.length) {
       month = months[elements[0].index] || null;
+      const service = chartService(chart, elements[0]);
+      if (service) supplier = serviceSupplierKey(service);
     }
     if (!month) month = monthFromChart(event, chart);
-    openReceipt(month);
+    openReceipt(month, supplier);
   },
 };
 
@@ -381,50 +404,94 @@ function escapeHtml(text) {
 }
 
 const SERVICE_HINTS = {
-  'СОДЕРЖАНИЕ ЖИЛОГО ПОМЕЩЕНИЯ': 'Платим управляющей компании за дом: уборка и ремонт подъездов, обслуживание лифтов, сантехники, электрики и кровли, содержание придомовой территории, текущий ремонт.',
-  'ВЗНОС НА КАПИТАЛЬНЫЙ РЕМОНТ': 'Накопительный взнос в фонд капремонта: за эти деньги через годы ремонтируют крышу, фасад, лифты и инженерные сети дома. Размер взноса устанавливает регион, а не УК.',
-  'ЭЛЕКТРОСНАБЖЕНИЕ ДЕНЬ ОДН': 'Электроэнергия на общие зоны дома — освещение подъездов и двора, лифты, насосы — по дневному тарифу. Расход делится между квартирами пропорционально площади.',
-  'ЭЛЕКТРОСНАБЖЕНИЕ НОЧЬ ОДН': 'Электроэнергия на общие зоны дома — освещение подъездов и двора, лифты, насосы — по ночному (дешёвому) тарифу. Делится между квартирами пропорционально площади.',
-  'ВОДООТВЕДЕНИЕ ОДН': 'Отведение сточных вод из мест общего пользования (уборка подъездов, санузлы МОП). Сумма делится между квартирами пропорционально площади.',
-  'ХОЛОДНОЕ В/С ОДН': 'Холодная вода для общих зон дома: уборка подъездов, полив газонов. Расход делится между квартирами пропорционально площади.',
-  'ОБРАЩЕНИЕ С ТКО': 'Платим региональному оператору за вывоз, сортировку и переработку мусора. Тариф считается по площади квартиры, а не по числу жильцов.',
-  'ВОДООТВЕДЕНИЕ': 'Платим за приём и очистку сточных вод, которые уходят из квартиры в канализацию. Считается по суммарному водопотреблению (или счётчику).',
-  'ХОЛОДНОЕ В/С': 'Платим поставщику за холодную воду в квартиру: питьё, готовка, санузел. Расход — по счётчику, без счётчика — по нормативу на человека.',
-  'ГОРЯЧЕЕ В/С (НОСИТЕЛЬ)': 'Платим за горячую воду: саму воду и тепло, которое её нагревает. Расход — по счётчику или нормативу; деньги идут ресурсоснабжающей организации.',
-  'ТЕПЛОСНАБЖЕНИЕ': 'Отопление квартиры: тепло от котельной или ТЭЦ. В Московской области платится равными долями круглый год.',
-  'ГАЗОСНАБЖЕНИЕ': 'Газ для плиты и/или газового котла. Оплата — по счётчику или по нормативу на человека.',
-  'ОХРАНА': 'Платим за охрану дома: пульт, видеонаблюдение, обход территории. Услуга появляется по решению общего собрания жильцов.',
-  'ДОБРОВОЛЬНОЕ СТРАХОВАНИЕ': 'Добровольная страховка жилья от затопления, пожара и т.п. Не обязательна: можно отказаться, исключив строку из квитанции.',
-  'УСЛУГИ КОНСЬЕРЖА': 'Платим за работу консьержа: пропускной режим, порядок в подъезде, приём заявок жильцов.',
-  'ДОМОФОН': 'Обслуживание домофона и подъездных замков: ремонт, замена трубок, связь.',
+  'СОДЕРЖАНИЕ ЖИЛОГО ПОМЕЩЕНИЯ': 'Плата управляющей компании за содержание общего имущества дома: уборка подъездов и придомовой территории, текущий ремонт, обслуживание лифтов, инженерных сетей и кровли, управление домом. Минимальный перечень работ — по постановлению Правительства РФ № 290; размер платы утверждает общее собрание собственников. Тариф — за 1 кв.м площади.',
+  'ВЗНОС НА КАПИТАЛЬНЫЙ РЕМОНТ': 'Обязательный взнос собственника в фонд капитального ремонта (ЖК РФ, ст. 154). За счёт фонда ремонтируют крышу, фасад, лифты и инженерные сети. Минимальный размер взноса устанавливает регион; деньги собирает региональный оператор или спецсчёт дома. Платят собственники, а не наниматели.',
+  'ЭЛЕКТРОСНАБЖЕНИЕ ДЕНЬ ОДН': 'Электроэнергия на содержание общего имущества по дневной зоне тарифа: освещение подъездов и двора, лифты, насосы, вентиляция. Считается по нормативу с перерасчётом по общедомовому счётчику (ОДПУ) и делится между квартирами пропорционально площади.',
+  'ЭЛЕКТРОСНАБЖЕНИЕ НОЧЬ ОДН': 'Электроэнергия на содержание общего имущества по ночной (дешёвой) зоне тарифа. Считается по нормативу или общедомовому счётчику и распределяется между квартирами пропорционально площади.',
+  'ЭЛЕКТРОЭНЕРГИЯ (Т1) ДЕНЬ': 'Электроэнергия в квартире по дневному тарифу (в Московской области обычно 7:00–23:00). Расход — разница показаний счётчика, объём умножается на дневной тариф; в счёте Мосэнергосбыта видны показания: старт → конец.',
+  'ЭЛЕКТРОЭНЕРГИЯ (Т2) НОЧЬ': 'Электроэнергия в квартире по ночному тарифу (обычно 23:00–7:00) — он ниже дневного. Нужен двухтарифный счётчик; расход умножается на ночной тариф.',
+  'ЖКУ (ИТОГ ПО КВИТАНЦИИ)': 'Итоговая сумма из квитанции, в которой нет расшифровки по услугам (только общая сумма к оплате). Показывается, если за этот месяц нет детальной квитанции от другого поставщика.',
+  'ПОДОГРЕВ ВОДЫ ДЛЯ ГВС': 'Компонент «тепловая энергия» двухкомпонентного тарифа ГВС: сколько тепла (Гкал) потрачено на нагрев холодной воды до горячей. Оплачивается ресурсоснабжающей организации отдельно от самой воды — компонента «теплоноситель».',
+  'ВОДООТВЕДЕНИЕ ОДН': 'Отведение сточных вод на содержание общего имущества (КР на СОИ): смывы при уборке подъездов, санузлы МОП. Входит в плату за содержание жилого помещения и распределяется между квартирами пропорционально площади.',
+  'ХОЛОДНОЕ В/С ОДН': 'Холодная вода на содержание общего имущества (КР на СОИ, раньше — ОДН): уборка подъездов, санузлы МОП, полив газонов, промывка систем. Считается по нормативу с перерасчётом по общедомовому счётчику и делится между квартирами по площади.',
+  'ОБРАЩЕНИЕ С ТКО': 'Вывоз, сортировка и переработка твёрдых коммунальных отходов. Коммунальная услуга с 2019 года; оказывает региональный оператор. В Московской области тариф считается по площади квартиры, в других регионах — по числу жильцов.',
+  'ВОДООТВЕДЕНИЕ': 'Плата за отведение и очистку сточных вод: всё, что уходит из квартиры в канализацию. Объём обычно равен сумме холодной и горячей воды по счётчикам или нормативам. Это коммунальная услуга.',
+  'ХОЛОДНОЕ В/С': 'Плата за холодную воду в квартиру: питьё, готовка, санузел. Считается по индивидуальному счётчику (ИПУ), а если его нет — по нормативу на человека. Вода на общедомовые нужды оплачивается отдельной строкой (КР на СОИ).',
+  'ГОРЯЧЕЕ В/С (НОСИТЕЛЬ)': 'При двухкомпонентном тарифе ГВС эта строка — компонент «теплоноситель»: сама горячая вода (куб. м). Нагрев воды оплачивается отдельно как тепловая энергия (Гкал) — строка «Подогрев воды для ГВС». При одноставочном тарифе вся горячая вода идёт одной строкой.',
+  'Отопление': 'Тепловая энергия (Гкал) на отопление квартиры. Платят равными долями 1/12 круглый год или только в отопительный сезон — зависит от региона и решения. В доме с общедомовым счётчиком объём распределяется между квартирами по площади.',
+  'ТЕПЛОСНАБЖЕНИЕ': 'Тепловая энергия на отопление квартиры: от котельной или ТЭЦ. В большинстве домов Московской области платят равными долями круглый год (1/12); при расчёте по факту — только в отопительный сезон.',
+  'ГАЗОСНАБЖЕНИЕ': 'Газ для плиты, водонагревателя или котла. Оплата — по счётчику, при его отсутствии — по нормативу на человека; тариф и норматив зависят от назначения газа (плита/котёл) и региона.',
+  'ОХРАНА': 'Услуга охраны дома: пост, видеонаблюдение, пульт, обход территории. Дополнительная жилищная услуга; её вводят решением общего собрания собственников, размер платы утверждает собрание.',
+  'ДОБРОВОЛЬНОЕ СТРАХОВАНИЕ': 'Добровольная страховка жилья от затопления, пожара и других аварий. Не обязательна: можно исключить из квитанции заявлением. В ЕПД её показывают отдельно — суммы «с учётом» и «без учёта добровольного страхования».',
+  'УСЛУГИ КОНСЬЕРЖА': 'Работа консьержа: пропускной режим, порядок в подъезде, приём заявок жильцов. Дополнительная жилищная услуга, её вводят решением общего собрания; оплата — за месяц или с 1 кв.м площади.',
+  'ДОМОФОН': 'Обслуживание домофона и подъездных замков: ремонт, замена трубок, связь, абонентское обслуживание. Относится к дополнительным жилищным услугам.',
 };
 
 const GROUP_HINTS = {
-  'Жилищные услуги': 'Платим за сам дом и общее имущество: содержание и текущий ремонт, капремонт и ресурсы на общие зоны (ОДН). Деньги получают управляющая компания и подрядчики.',
-  'Коммунальные услуги': 'Платим за ресурсы, которые потребляет квартира: вода, водоотведение, электроэнергия, тепло, вывоз мусора. Считается по счётчикам или нормативам, деньги идут ресурсоснабжающим организациям.',
-  'Иные услуги': 'Дополнительные услуги по решению жильцов или включённые в квитанцию: охрана, консьерж, добровольное страхование.',
+  'Жилищные услуги': 'Плата за жилое помещение (ЖК РФ, ст. 154): управление домом, содержание и текущий ремонт общего имущества, взнос на капремонт, а также дополнительные услуги по решению общего собрания (охрана, консьерж, домофон). Деньги получают управляющая компания, ТСЖ или подрядчики.',
+  'Общедомовые нужды (КР на СОИ)': 'Коммунальные ресурсы (КР) на содержание общего имущества: вода, водоотведение и электроэнергия для подъездов, лифтов, освещения двора, полива. С 2017 года входят в плату за содержание жилого помещения, а не в коммунальные услуги квартиры. Считаются по нормативу с перерасчётом по общедомовому счётчику (ОДПУ).',
+  'Коммунальные услуги': 'Ресурсы, которые потребляет квартира: холодная и горячая вода, водоотведение, электроэнергия, отопление, газ, обращение с ТКО. Считаются по счётчикам или нормативам; деньги идут ресурсоснабжающим организациям. Обращение с ТКО — коммунальная услуга с 2019 года.',
+  'Иные услуги': 'Дополнительные и добровольные услуги, не входящие в содержание дома и коммунальные ресурсы: добровольное страхование, антенна, радиоточка. От страхования можно отказаться заявлением.',
+  'Прочие услуги': 'Строки из платёжных документов, которые не удалось отнести к жилищным, коммунальным или иным услугам.',
   'Услуги': 'Услуги из вашего платёжного документа.',
 };
+
+function supplierNames(service) {
+  const map = (payload && payload.categories && payload.categories.suppliers) || {};
+  return map[service] || [];
+}
+
+function supplierNote(service) {
+  const list = (payload && payload.categories && payload.categories.suppliersList) || [];
+  if (list.length < 2) return '';
+  const names = supplierNames(service);
+  return names.length ? ' · ' + names.join(', ') : '';
+}
+
+function readingValue(value) {
+  return value === null || value === undefined ? '—' : quantityFmt.format(value);
+}
+
+function readingNote(service, index) {
+  const categories = (payload && payload.categories) || {};
+  const month = (categories.months || [])[index];
+  const reading = ((categories.readings || {})[service] || {})[month];
+  if (!reading || (reading.start === null && reading.end === null)) return '';
+  return ' (показания: ' + readingValue(reading.start) + ' → ' + readingValue(reading.end) + ')';
+}
+
+function serviceTip(service) {
+  const names = supplierNames(service);
+  const hint = serviceHint(service);
+  return names.length ? hint + '\n\nПоставщик: ' + names.join(', ') : hint;
+}
 
 function serviceHint(service) {
   if (SERVICE_HINTS[service]) return SERVICE_HINTS[service];
   const upper = String(service).toUpperCase();
-  if (upper.includes('ОДН')) {
+  const shared = /(^|[^А-ЯЁ])(ОДН|СОИ|КРСОИ|КР)([^А-ЯЁ]|$)/.test(upper) || upper.includes('ОБЩЕДОМ');
+  if (shared) {
     if (upper.includes('ХОЛОДН')) return SERVICE_HINTS['ХОЛОДНОЕ В/С ОДН'];
-    if (upper.includes('ГОРЯЧ')) return 'Горячая вода для общих зон дома: уборка подъездов, санузлы МОП. Расход делится между квартирами пропорционально площади.';
+    if (upper.includes('ГОРЯЧ')) return 'Горячая вода на содержание общего имущества: уборка подъездов, санузлы МОП. Считается по нормативу или общедомовому счётчику и делится между квартирами по площади.';
     if (upper.includes('ВОДООТВЕД')) return SERVICE_HINTS['ВОДООТВЕДЕНИЕ ОДН'];
     if (upper.includes('ЭЛЕКТРО')) return SERVICE_HINTS['ЭЛЕКТРОСНАБЖЕНИЕ ДЕНЬ ОДН'];
-    return 'Ресурс на общедомовые нужды: расход на подъезды, лифты и другие общие зоны. Делится между квартирами пропорционально площади.';
+    return 'Коммунальный ресурс на содержание общего имущества (КР на СОИ): расход на подъезды, лифты и другие общие зоны. Входит в плату за содержание жилого помещения.';
   }
   if (upper.startsWith('ХОЛОДН')) return SERVICE_HINTS['ХОЛОДНОЕ В/С'];
   if (upper.startsWith('ГОРЯЧ')) return SERVICE_HINTS['ГОРЯЧЕЕ В/С (НОСИТЕЛЬ)'];
   if (upper.startsWith('ВОДООТВЕД')) return SERVICE_HINTS['ВОДООТВЕДЕНИЕ'];
+  if (upper.startsWith('ПОДОГРЕВ')) return SERVICE_HINTS['ПОДОГРЕВ ВОДЫ ДЛЯ ГВС'];
   if (upper.startsWith('ЭЛЕКТРО')) return 'Платим за электроэнергию в квартире: свет, бытовая техника, готовка. Расход — по счётчику, тариф зависит от зоны суток.';
-  if (upper.includes('КАПИТАЛЬН')) return SERVICE_HINTS['ВЗНОС НА КАПИТАЛЬНЫЙ РЕМОНТ'];
+  if (upper.includes('КАПИТАЛЬН') || upper.includes('КАПРЕМОНТ')) return SERVICE_HINTS['ВЗНОС НА КАПИТАЛЬНЫЙ РЕМОНТ'];
   if (upper.includes('СОДЕРЖАНИЕ')) return SERVICE_HINTS['СОДЕРЖАНИЕ ЖИЛОГО ПОМЕЩЕНИЯ'];
-  if (upper.includes('ТЕПЛ') || upper.includes('ОТОПЛ')) return SERVICE_HINTS['ТЕПЛОСНАБЖЕНИЕ'];
+  if (upper.includes('ТЕПЛ') || upper.includes('ОТОПЛ')) return SERVICE_HINTS['Отопление'];
   if (upper.includes('ГАЗ')) return SERVICE_HINTS['ГАЗОСНАБЖЕНИЕ'];
-  return 'Строка из вашей квитанции. Точную расшифровку смотрите в ЕПД — кликните по месяцу на графике или в таблице.';
+  if (upper.includes('ТКО') || upper.includes('ОТХОД')) return SERVICE_HINTS['ОБРАЩЕНИЕ С ТКО'];
+  if (upper.includes('СТРАХОВАН')) return SERVICE_HINTS['ДОБРОВОЛЬНОЕ СТРАХОВАНИЕ'];
+  if (upper.includes('КОНСЬЕРЖ')) return SERVICE_HINTS['УСЛУГИ КОНСЬЕРЖА'];
+  if (upper.includes('ОХРАН')) return SERVICE_HINTS['ОХРАНА'];
+  if (upper.includes('ДОМОФОН')) return SERVICE_HINTS['ДОМОФОН'];
+  return 'Строка из вашей квитанции. Точную расшифровку смотрите в квитанции — кликните по месяцу на графике или в таблице.';
 }
 
 function groupHint(group) {
@@ -558,7 +625,8 @@ function renderCategories() {
 
   if (!months.length) {
     notice.hidden = false;
-    notice.textContent = categories.error || 'ЛКК не вернул разбивку по услугам.';
+    notice.textContent = categories.error
+      || 'В БД нет разобранных платёжек за выбранный период. Положите PDF в data/receipts/<поставщик>/ и нажмите кнопку обновления (⟳).';
     if (categoriesChart) categoriesChart.destroy();
     categoriesChart = null;
     document.getElementById('categoriesTable').innerHTML = '';
@@ -569,11 +637,11 @@ function renderCategories() {
   if (categories.error) {
     notice.hidden = false;
     notice.textContent = categories.error;
-  } else if (categories.source === 'receipts' || categories.history) {
-    notice.hidden = true;
-  } else {
+  } else if (categories.warning) {
     notice.hidden = false;
-    notice.textContent = 'ЛКК отдаёт разбивку по услугам только за текущий закрытый период — показан ' + formatMonth(months[0]) + '. Квитанций ЕПД за другие месяцы ЛКК не вернул.';
+    notice.textContent = categories.warning;
+  } else {
+    notice.hidden = true;
   }
 
   const services = categories.services || {};
@@ -651,9 +719,10 @@ function renderCategories() {
                 title: monthTitle,
                 label: (context) => {
                   if (context.dataset.yAxisID === 'y1') {
-                    return context.dataset.label + ': ' + quantityFmt.format(context.parsed.y);
+                    return context.dataset.label + ': ' + quantityFmt.format(context.parsed.y)
+                      + readingNote(selectedService, context.dataIndex) + supplierNote(selectedService);
                   }
-                  return context.dataset.label + ': ' + money.format(context.parsed.y) + ' ₽';
+                  return context.dataset.label + ': ' + money.format(context.parsed.y) + ' ₽' + supplierNote(selectedService);
                 },
               },
             },
@@ -677,7 +746,7 @@ function renderCategories() {
           maintainAspectRatio: false,
           plugins: {
             legend: {display: false},
-            tooltip: {callbacks: {label: (context) => context.label + ': ' + money.format(context.parsed) + ' ₽'}},
+            tooltip: {callbacks: {label: (context) => context.label + ': ' + money.format(context.parsed) + ' ₽' + supplierNote(context.label)}},
           },
         },
       });
@@ -710,7 +779,7 @@ function renderCategories() {
             tooltip: {
               callbacks: {
                 title: monthTitle,
-                label: (context) => context.dataset.label + ': ' + money.format(context.parsed.y) + ' ₽',
+                label: (context) => context.dataset.label + ': ' + money.format(context.parsed.y) + ' ₽' + supplierNote(context.dataset.label),
               },
             },
           },
@@ -726,18 +795,25 @@ function renderCategories() {
   if (isVolume) {
     const chargedMap = (categories.charged || {})[selectedService] || {};
     const volumeMap = (categories.volumes || {})[selectedService] || {};
+    const readingsMap = (categories.readings || {})[selectedService] || {};
+    const hasReadings = Object.keys(readingsMap).length > 0;
     const unit = units[selectedService] || '';
     let chargedSum = 0;
     let volumeSum = 0;
-    html = '<thead><tr><th>Месяц</th><th>Начислено, ₽</th><th>Объём' + (unit ? ' (' + unit + ')' : '') + '</th></tr></thead><tbody>';
+    html = '<thead><tr><th>Месяц</th><th>Начислено, ₽</th><th>Объём' + (unit ? ' (' + unit + ')' : '') + '</th>'
+      + (hasReadings ? '<th>Показания</th>' : '') + '</tr></thead><tbody>';
     for (const month of months) {
       const charged = chargedMap[month] || 0;
       const volume = volumeMap[month] || 0;
+      const reading = readingsMap[month];
       chargedSum += charged;
       volumeSum += volume;
-      html += '<tr><td>' + monthLink(month) + '</td><td>' + renderValue(charged) + '</td><td>' + (volume ? quantityFmt.format(volume) : '—') + '</td></tr>';
+      html += '<tr><td>' + monthLink(month, selectedService) + '</td><td>' + renderValue(charged) + '</td><td>' + (volume ? quantityFmt.format(volume) : '—') + '</td>'
+        + (hasReadings ? '<td>' + (reading ? readingValue(reading.start) + ' → ' + readingValue(reading.end) : '—') + '</td>' : '')
+        + '</tr>';
     }
-    html += '</tbody><tfoot><tr><td>ИТОГО</td><td>' + renderValue(chargedSum) + '</td><td>' + (volumeSum ? quantityFmt.format(volumeSum) : '—') + '</td></tr></tfoot>';
+    html += '</tbody><tfoot><tr><td>ИТОГО</td><td>' + renderValue(chargedSum) + '</td><td>' + (volumeSum ? quantityFmt.format(volumeSum) : '—') + '</td>'
+      + (hasReadings ? '<td></td>' : '') + '</tr></tfoot>';
   } else {
     const tableEntries = orderedServices
       .slice()
@@ -748,7 +824,11 @@ function renderCategories() {
     html += '<th>Итого</th></tr></thead><tbody>';
     for (const [service, byMonth] of tableEntries) {
       const sum = Object.values(byMonth).reduce((acc, value) => acc + value, 0);
-      html += '<tr><td>' + service + '</td>';
+      const names = supplierNames(service);
+      const showSupplier = names.length > 1;
+      html += '<tr><td>' + escapeHtml(service)
+        + (showSupplier ? '<span class="service-supplier">' + escapeHtml(names.join(', ')) + '</span>' : '')
+        + '</td>';
       for (const month of months) html += '<td>' + renderValue(byMonth[month]) + '</td>';
       html += '<td><b>' + renderValue(sum) + '</b></td></tr>';
     }
@@ -758,7 +838,18 @@ function renderCategories() {
     html += '<td>' + renderValue(categories.grandTotal) + '</td></tr></tfoot>';
   }
   table.innerHTML = html;
+  fitChart();
 }
+
+function fitChart() {
+  const box = document.getElementById('categoriesChartBox');
+  if (!box) return;
+  const card = box.closest('.card');
+  const top = box.getBoundingClientRect().top + window.scrollY;
+  const bottomGap = 24 + (card ? parseFloat(getComputedStyle(card).paddingBottom) || 0 : 0);
+  box.style.height = Math.max(320, window.innerHeight - top - bottomGap) + 'px';
+}
+window.addEventListener('resize', fitChart);
 
 function renderLegend(services, colors, isVolume) {
   const box = document.getElementById('legend');
@@ -782,7 +873,7 @@ function renderLegend(services, colors, isVolume) {
       html += '<div class="legend-item' + state + '" data-service="' + encodeURIComponent(service) + '">'
         + '<span class="swatch" style="background:' + colors[service] + '"></span>'
         + '<span>' + escapeHtml(service) + '</span>'
-        + tipHtml(serviceHint(service))
+        + tipHtml(serviceTip(service))
         + '</div>';
     }
     html += '</div>';
@@ -861,122 +952,39 @@ monthsSelect.addEventListener('change', () => loadData(false));
 
 @dataclass
 class WebConfig:
-    phone: str | None = None
-    password: str | None = None
-    token: str | None = None
-    token_file: str | None = None
-    account_filter: list[str] = field(default_factory=list)
     months: int = 12
-    shift: int = 1
-    anchor_day: int = 15
     value: str = "charged"
     end_month: str | None = None
-    cache_dir: str | None = "data/raw"
+    db_path: str | None = "data/mosobleirc.sqlite"
     receipts_dir: str | None = "data/receipts"
     host: str = "0.0.0.0"
     port: int = 8765
-
-
-def prompt_code(factor: str) -> str:
-    if not sys.stdin.isatty():
-        raise MosOblEIRCError(
-            f"Нужен код второго фактора ({factor}), но ввод недоступен. Задайте MOSOBLEIRC_TOKEN"
-        )
-    return input(f"Код подтверждения ({factor}): ").strip()
 
 
 class State:
     def __init__(self, config: WebConfig):
         self.config = config
         self.lock = threading.RLock()
-        self._accounts: list[dict] | None = None
         self._data_cache: dict = {}
-        self.token_file = str(Path(config.token_file).expanduser()) if config.token_file else None
-        self.client = MosOblEIRCClient(
-            phone=config.phone,
-            password=config.password,
-            token=config.token or load_token(self.token_file, config.phone),
-            prompt_code=prompt_code,
-        )
+        self.store = Store(config.db_path)
+        if config.receipts_dir:
+            try:
+                Path(config.receipts_dir).mkdir(parents=True, exist_ok=True)
+            except OSError:
+                pass
 
-    def _ensure_login(self) -> None:
-        if self.client.token:
-            return
-        print("[web] вход в ЛКК…", file=sys.stderr)
-        token = self.client.login()
-        print("[web] вход выполнен", file=sys.stderr)
-        save_token(self.token_file, self.config.phone, token)
-
-    def accounts(self, refresh: bool = False) -> list[dict]:
+    def receipt_pdf(self, month: str, supplier: str | None = None) -> bytes:
         with self.lock:
-            if self._accounts is None or refresh:
-                self._ensure_login()
-                self._accounts = self.client.accounts()
-            return self._accounts
-
-    def select_accounts(self, account_id: str | None) -> list[dict]:
-        accounts = self.accounts()
-        if account_id:
-            return [account for account in accounts if account["personal_account_id"] == account_id]
-        if self.config.account_filter:
-            selected = [
-                account
-                for account in accounts
-                if any(
-                    needle.lower()
-                    in f"{account['id']} {account['personal_account_id']} {account['name']}".lower()
-                    for needle in self.config.account_filter
-                )
-            ]
-            if selected:
-                return selected
-        return accounts
-
-    @property
-    def default_account_id(self) -> str:
-        if len(self.config.account_filter) == 1:
-            matches = [
-                account
-                for account in self.accounts()
-                if self.config.account_filter[0].lower()
-                in f"{account['id']} {account['personal_account_id']} {account['name']}".lower()
-            ]
-            if len(matches) == 1:
-                return matches[0]["personal_account_id"]
-        return ""
-
-    def receipt_pdf(self, month: str) -> bytes:
-        with self.lock:
-            self._ensure_login()
-            accounts = self.select_accounts(None)
-            if not accounts:
-                raise MosOblEIRCError("Лицевой счёт не найден")
-
-            cache = ReceiptCache(self.config.receipts_dir)
-            for account in accounts:
-                data = cache.load(account["personal_account_id"], month)
-                if data:
-                    return data
-
-            last_error: MosOblEIRCError | None = None
-            for account in accounts:
-                try:
-                    data = self.client.receipt_pdf(account["personal_account_id"], f"{month}-01")
-                except MosOblEIRCError as error:
-                    last_error = error
-                    continue
-                cache.save(account["personal_account_id"], month, data)
-                return data
-
-        message = f"Квитанция за {month} не найдена"
-        if last_error:
-            message = f"{message}: {last_error}"
-        raise MosOblEIRCError(message)
+            path = find_supplier_receipt(self.config.receipts_dir, month, supplier=supplier)
+            if not path and supplier:
+                path = find_supplier_receipt(self.config.receipts_dir, month)
+            if not path:
+                raise FileNotFoundError(f"Квитанция за {month} не найдена в папках поставщиков")
+            return path.read_bytes()
 
     def data(
         self,
         *,
-        account_id: str | None,
         months: int | None,
         value: str | None,
         force: bool = False,
@@ -987,91 +995,131 @@ class State:
             raise ValueError(f"Неизвестный показатель: {value}")
         months = max(1, min(months, 60))
 
-        def log(account, *args):
-            print(f"[web] {account['name']}:", *args, file=sys.stderr)
+        def log(supplier, month, note):
+            print(f"[web] {supplier_label(supplier)}: {month} {note}", file=sys.stderr)
 
         with self.lock:
-            self._ensure_login()
-            accounts = self.select_accounts(account_id)
-            if not accounts:
-                raise MosOblEIRCError("Лицевой счёт не найден")
-            end_month = self.config.end_month or previous_month()
-            month_list = month_range(end_month, months)
-
-            cache_key = (
-                tuple(sorted(account["personal_account_id"] for account in accounts)),
-                tuple(month_list),
-                value,
-            )
+            cache_key = (self.config.end_month, months, value)
             if not force:
                 cached_payload = self._data_cache.get(cache_key)
                 if cached_payload is not None:
                     return {
                         **cached_payload,
-                        "fetch": {"cacheHit": True, "downloaded": 0, "parsed": 0, "cached": 0},
+                        "fetch": {"cacheHit": True, "parsed": 0, "cached": 0},
                     }
 
             report: dict = {}
-            receipt_rows: list = []
             receipts_error: str | None = None
-            if not pdf_support_available():
-                receipts_error = "Квитанции ЕПД не разобраны: установите зависимости — pip install -r requirements.txt"
-                log(accounts[0], receipts_error)
-            else:
-                try:
-                    receipt_rows = collect_receipt_charges(
-                        self.client,
-                        accounts,
-                        month_list,
-                        cache_dir=self.config.receipts_dir,
-                        force=force,
-                        log=lambda account, month, note: log(account, month, note),
-                        report=report,
-                    )
-                except MosOblEIRCError as error:
-                    log(accounts[0], f"квитанции недоступны: {error}")
+            parsed_now = 0
+            warnings: list[str] | None = None
+            refresh = force
 
-            if receipt_rows:
-                category_rows = receipt_rows
-                category_source = "receipts"
-            else:
-                category_rows = collect_charges(
-                    self.client,
-                    accounts,
-                    month_list,
-                    anchor_day=self.config.anchor_day,
-                    shift=self.config.shift,
-                    cache_dir=self.config.cache_dir,
-                    force=force,
-                    log=lambda account, month, requested_date, count, source: log(
-                        account, month, f"(запрос {requested_date}, {source}, услуг: {count})"
-                    ),
+            if not refresh:
+                # обычная загрузка страницы — только то, что уже разобрано в БД
+                category_rows = [
+                    charge_from_dict(item) for item in self.store.load_all_receipt_charges()
+                ]
+            elif not pdf_support_available():
+                receipts_error = (
+                    "PDF не разбираются: установите зависимости — pip install -r requirements.txt"
                 )
-                category_source = "charge-details"
+                print(f"[web] {receipts_error}", file=sys.stderr)
+                category_rows = [
+                    charge_from_dict(item) for item in self.store.load_all_receipt_charges()
+                ]
+            else:
+                category_rows = collect_receipt_charges(
+                    self.config.receipts_dir,
+                    None,
+                    store=self.store,
+                    log=log,
+                    report=report,
+                )
+                parsed_now = report.get("parsed", 0)
+                if self.store.enabled:
+                    pruned = self.store.prune_receipts(set(report.get("files", [])))
+                    if pruned:
+                        print(f"[web] из БД удалено устаревших разборов: {pruned}", file=sys.stderr)
+
+            if self.store.enabled:
+                warnings = [
+                    f"{supplier_label(item['supplier'])}: {Path(item['path']).name} — {item['note']}"
+                    for item in self.store.load_warnings()
+                ]
+            elif warnings is None:
+                warnings = report.get("warnings") or []
+
+            if self.config.end_month:
+                month_list = month_range(self.config.end_month, months)
+                wanted = set(month_list)
+            else:
+                available = sorted({row.month for row in category_rows if row.month})
+                month_list = available[-months:]
+                wanted = set(month_list)
+            category_rows = [row for row in category_rows if row.month in wanted]
 
         months_cat, services, totals_cat, grand_total = aggregate(category_rows, value)
-        history = has_category_history(category_rows)
 
         _, charged_services, _, _ = aggregate(category_rows, "charged")
         _, volume_services, _, _ = aggregate(category_rows, "volume")
 
         service_groups: dict[str, str] = {}
+        service_suppliers: dict[str, list[str]] = {}
+        service_suppliers_raw: dict[str, list[str]] = {}
         for row in category_rows:
-            service_groups.setdefault(row.service, row.group or "Услуги")
+            # группу определяем по названию услуги, а не по разделу конкретной платёжки:
+            # так одна и та же услуга у разных поставщиков попадает в один раздел
+            service_groups.setdefault(
+                row.service,
+                canonical_service_group(row.service, row.group or FALLBACK_GROUP),
+            )
+            label = supplier_label(row.supplier)
+            names = service_suppliers.setdefault(row.service, [])
+            if label and label not in names:
+                names.append(label)
+            keys = service_suppliers_raw.setdefault(row.service, [])
+            if row.supplier and row.supplier not in keys:
+                keys.append(row.supplier)
         groups: dict[str, list[str]] = {}
-        for service in services:
-            groups.setdefault(service_groups.get(service, "Услуги"), []).append(service)
+        for group_name in GROUP_ORDER:
+            names = [
+                service
+                for service in services
+                if service_groups.get(service, FALLBACK_GROUP) == group_name
+            ]
+            if names:
+                groups[group_name] = names
+        for group_name in service_groups.values():
+            if group_name in groups:
+                continue
+            names = [
+                service
+                for service in services
+                if service_groups.get(service, FALLBACK_GROUP) == group_name
+            ]
+            if names:
+                groups[group_name] = names
         order = [service for names in groups.values() for service in names]
 
-        if category_source == "charge-details" and not history and months_cat:
-            latest = months_cat[-1]
-            services = {
-                service: {latest: by_month.get(latest, 0.0)}
-                for service, by_month in services.items()
+        suppliers_list = sorted(
+            {name for names in service_suppliers.values() for name in names}
+        )
+
+        service_readings: dict[str, dict[str, dict]] = {}
+        for row in category_rows:
+            if row.reading_start is None and row.reading_end is None:
+                continue
+            service_readings.setdefault(row.service, {})[row.month] = {
+                "start": row.reading_start,
+                "end": row.reading_end,
             }
-            totals_cat = {latest: totals_cat.get(latest, 0.0)}
-            grand_total = totals_cat[latest]
-            months_cat = [latest]
+
+        warning: str | None = None
+        if warnings:
+            shown = warnings[:3]
+            warning = "Не все платёжки удалось разобрать: " + "; ".join(shown)
+            if len(warnings) > len(shown):
+                warning += f"; и ещё {len(warnings) - len(shown)}"
 
         payload = {
             "months": month_list,
@@ -1085,27 +1133,25 @@ class State:
                 "totals": totals_cat,
                 "grandTotal": grand_total,
                 "units": {row.service: row.unit for row in category_rows if row.unit},
+                "suppliers": service_suppliers,
+                "supplierKeys": service_suppliers_raw,
+                "suppliersList": suppliers_list,
+                "readings": service_readings,
                 "value": value,
-                "history": history,
-                "source": category_source,
+                "source": "receipts",
                 "error": receipts_error,
+                "warning": warning,
             },
-            "accounts": [
-                {"name": account["name"], "personal_account_id": account["personal_account_id"]}
-                for account in accounts
-            ],
             "rows": len(category_rows),
             "fetch": {
                 "cacheHit": False,
-                "downloaded": report.get("downloaded", 0),
-                "parsed": report.get("parsed", 0),
+                "parsed": parsed_now,
                 "cached": report.get("cached", 0),
+                "source": "folders" if refresh else "db",
             },
         }
 
         with self.lock:
-            if force or report.get("downloaded") or report.get("parsed"):
-                self._data_cache.clear()
             self._data_cache[cache_key] = payload
 
         return payload
@@ -1142,21 +1188,10 @@ class Handler(BaseHTTPRequestHandler):
                 self._send_bytes(html.encode("utf-8"), "text/html; charset=utf-8")
                 return
 
-            if parsed.path == "/api/accounts":
-                refresh = query.get("refresh", ["0"])[0] == "1"
-                self._send_json(
-                    {
-                        "accounts": self.state.accounts(refresh=refresh),
-                        "default": self.state.default_account_id,
-                    }
-                )
-                return
-
             if parsed.path == "/api/data":
                 months_value = query.get("months", [None])[0]
                 self._send_json(
                     self.state.data(
-                        account_id=query.get("account_id", [None])[0] or None,
                         months=int(months_value) if months_value else None,
                         value=query.get("value", [None])[0] or None,
                         force=query.get("force", ["0"])[0] == "1",
@@ -1168,7 +1203,8 @@ class Handler(BaseHTTPRequestHandler):
                 month = (query.get("month", [""])[0] or "").strip()
                 if not re.fullmatch(r"\d{4}-(0[1-9]|1[0-2])", month):
                     raise ValueError("Некорректный месяц, ожидается YYYY-MM")
-                data = self.state.receipt_pdf(month)
+                supplier = (query.get("supplier", [""])[0] or "").strip()
+                data = self.state.receipt_pdf(month, supplier or None)
                 self._send_bytes(
                     data,
                     "application/pdf",
@@ -1178,9 +1214,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
 
             self._send_json({"message": "not found"}, 404)
-        except MosOblEIRCError as error:
+        except FileNotFoundError as error:
             print(f"[web] ошибка: {error}", file=sys.stderr)
-            self._send_json({"message": str(error)}, 502)
+            self._send_json({"message": str(error)}, 404)
         except ValueError as error:
             print(f"[web] ошибка: {error}", file=sys.stderr)
             self._send_json({"message": str(error)}, 400)
@@ -1299,6 +1335,15 @@ def run_server(config: WebConfig) -> None:
     ip = primary_ip()
     if ip and ip not in ("127.0.0.1",):
         print(f"  http://{ip}:{config.port}/   (IP этой машины)", file=sys.stderr)
+    if config.db_path:
+        print(f"Кэш: {Path(config.db_path).resolve()} (SQLite)", file=sys.stderr)
+    if config.receipts_dir:
+        receipts_root = Path(config.receipts_dir).resolve()
+        print(f"Платёжки: {receipts_root}", file=sys.stderr)
+        print(
+            f"  папки поставщиков: {receipts_root}/<поставщик>/... (PDF, имя вида ГГГГ-ММ.pdf)",
+            file=sys.stderr,
+        )
 
     try:
         server.serve_forever()
@@ -1306,3 +1351,4 @@ def run_server(config: WebConfig) -> None:
         print("Остановлено", file=sys.stderr)
     finally:
         server.server_close()
+        state.store.close()
