@@ -32,7 +32,7 @@ from payments.stats import (  # noqa: E402
     supplier_label,
 )
 from payments.store import Store  # noqa: E402
-from payments.webapp import State, WebConfig  # noqa: E402
+from payments.webapp import INDEX_HTML, State, WebConfig  # noqa: E402
 
 REAL_PDF = ROOT / "data/receipts/mosobleirc/2026-08.pdf"
 REAL_PDF_JULY = ROOT / "data/receipts/mosobleirc/2026-07.pdf"
@@ -664,6 +664,22 @@ class TestCli(unittest.TestCase):
             first_line,
             "month;supplier;service;unit;volume;tariff;charged;reading_start;reading_end",
         )
+
+
+class TestWebPage(unittest.TestCase):
+    def test_period_options(self):
+        for months in (6, 12, 18, 24, 30, 36):
+            self.assertIn(f'<option value="{months}"', INDEX_HTML)
+
+    def test_page_is_not_branded(self):
+        self.assertNotIn("МосОблЕИРЦ", INDEX_HTML)
+        self.assertNotIn("mosobleirc", INDEX_HTML.lower())
+
+    def test_page_opens_supplier_receipt(self):
+        self.assertIn("/api/receipt_pdf?month=", INDEX_HTML)
+        self.assertIn("&supplier=", INDEX_HTML)
+        self.assertIn("supplierKeys", INDEX_HTML)
+        self.assertIn("fitChart", INDEX_HTML)
 
 
 if __name__ == "__main__":
