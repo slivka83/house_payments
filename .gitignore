@@ -14,4 +14,3 @@ data/receipts/**
 *.sqlite*
 .env
 !requirements.txt
-!.env.example

@@ -19,7 +19,7 @@ from .stats import (
 )
 from .store import Store
 
-DEFAULT_DB_PATH = Path("data/mosobleirc.sqlite")
+DEFAULT_DB_PATH = Path("data/payments.sqlite")
 DEFAULT_RECEIPTS_DIR = Path("data/receipts")
 
 
@@ -82,17 +82,17 @@ def load_dotenv(path: str | Path = ".env") -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="mosobleirc",
+        prog="payments",
         description="Начисления по месяцам и категориям из платёжек в папках поставщиков. "
-        "Все параметры можно задавать переменными окружения (MOSOBLEIRC_*) или файлом .env",
+        "Все параметры можно задавать переменными окружения (PAYMENTS_*) или файлом .env",
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     web = subparsers.add_parser("web", help="локальная веб-страница с графиком начислений")
     add_period_options(web)
     add_value_option(web)
-    web.add_argument("--host", default=os.environ.get("MOSOBLEIRC_HOST", "0.0.0.0"), help="адрес веб-сервера")
-    web.add_argument("--port", type=int, default=env_int("MOSOBLEIRC_PORT", 8765), help="порт веб-сервера")
+    web.add_argument("--host", default=os.environ.get("PAYMENTS_HOST", "0.0.0.0"), help="адрес веб-сервера")
+    web.add_argument("--port", type=int, default=env_int("PAYMENTS_PORT", 8765), help="порт веб-сервера")
     web.set_defaults(func=cmd_web)
 
     months = subparsers.add_parser("months", help="таблица начислений по месяцам и категориям")
@@ -104,7 +104,7 @@ def build_parser() -> argparse.ArgumentParser:
     suppliers = subparsers.add_parser("suppliers", help="папки поставщиков в каталоге платёжек")
     suppliers.add_argument(
         "--receipts-dir",
-        default=os.environ.get("MOSOBLEIRC_RECEIPTS_DIR", str(DEFAULT_RECEIPTS_DIR)),
+        default=os.environ.get("PAYMENTS_RECEIPTS_DIR", str(DEFAULT_RECEIPTS_DIR)),
         help="корневой каталог с папками поставщиков (по умолчанию data/receipts)",
     )
     suppliers.set_defaults(func=cmd_suppliers)
@@ -115,12 +115,12 @@ def build_parser() -> argparse.ArgumentParser:
 def add_data_options(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--db",
-        default=os.environ.get("MOSOBLEIRC_DB", str(DEFAULT_DB_PATH)),
-        help="файл БД SQLite с кэшем разбора (по умолчанию data/mosobleirc.sqlite)",
+        default=os.environ.get("PAYMENTS_DB", str(DEFAULT_DB_PATH)),
+        help="файл БД SQLite с кэшем разбора (по умолчанию data/payments.sqlite)",
     )
     parser.add_argument(
         "--receipts-dir",
-        default=os.environ.get("MOSOBLEIRC_RECEIPTS_DIR", str(DEFAULT_RECEIPTS_DIR)),
+        default=os.environ.get("PAYMENTS_RECEIPTS_DIR", str(DEFAULT_RECEIPTS_DIR)),
         help="корневой каталог с папками поставщиков: {каталог}/{поставщик}/**/*.pdf",
     )
     parser.add_argument("--no-cache", action="store_true", help="не читать и не писать кэш")
@@ -129,10 +129,10 @@ def add_data_options(parser: argparse.ArgumentParser) -> None:
 
 def add_period_options(parser: argparse.ArgumentParser) -> None:
     add_data_options(parser)
-    parser.add_argument("--months", type=int, default=env_int("MOSOBLEIRC_MONTHS", 12), help="сколько месяцев (по умолчанию 12)")
+    parser.add_argument("--months", type=int, default=env_int("PAYMENTS_MONTHS", 12), help="сколько месяцев (по умолчанию 12)")
     parser.add_argument(
         "--end-month",
-        default=os.environ.get("MOSOBLEIRC_END_MONTH"),
+        default=os.environ.get("PAYMENTS_END_MONTH"),
         help="последний месяц в формате YYYY-MM (по умолчанию последний месяц в папках)",
     )
 
@@ -141,7 +141,7 @@ def add_value_option(parser: argparse.ArgumentParser) -> None:
     parser.add_argument(
         "--value",
         choices=sorted(VALUE_FIELDS),
-        default=os.environ.get("MOSOBLEIRC_VALUE", "charged"),
+        default=os.environ.get("PAYMENTS_VALUE", "charged"),
         help="показатель: charged — начислено, volume — объём (по умолчанию charged)",
     )
 
@@ -152,7 +152,7 @@ def add_output_options(parser: argparse.ArgumentParser) -> None:
 
 
 def collect_rows(args) -> list[Charge]:
-    receipts_dir = None if args.no_cache else args.receipts_dir
+    receipts_dir = args.receipts_dir
     store = Store(None if args.no_cache else args.db)
 
     if not pdf_support_available():
@@ -201,7 +201,7 @@ def cmd_web(args) -> int:
         value=args.value,
         end_month=args.end_month,
         db_path=None if args.no_cache else args.db,
-        receipts_dir=None if args.no_cache else args.receipts_dir,
+        receipts_dir=args.receipts_dir,
         host=args.host,
         port=args.port,
     )

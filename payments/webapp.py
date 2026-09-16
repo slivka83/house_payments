@@ -37,7 +37,7 @@ INDEX_HTML = r"""<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>МосОблЕИРЦ — начисления</title>
+<title>Начисления по платёжкам</title>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
 <style>
 :root {
@@ -292,7 +292,7 @@ tfoot td { font-weight: 700; border-top: 1px solid var(--border); }
   </div>
 </div>
 <script>
-console.log('mosobleirc build __BUILD__');
+console.log('payments build __BUILD__');
 const money = new Intl.NumberFormat('ru-RU', {minimumFractionDigits: 2, maximumFractionDigits: 2});
 const compact = new Intl.NumberFormat('ru-RU', {maximumFractionDigits: 0});
 const PALETTE = ['#2f6fed', '#e0518a', '#f2a93b', '#2eb872', '#8a63d2', '#3aa8c1', '#d9534f', '#7cb342', '#b07aa1', '#667085', '#f06292', '#26a69a'];
@@ -955,7 +955,7 @@ class WebConfig:
     months: int = 12
     value: str = "charged"
     end_month: str | None = None
-    db_path: str | None = "data/mosobleirc.sqlite"
+    db_path: str | None = "data/payments.sqlite"
     receipts_dir: str | None = "data/receipts"
     host: str = "0.0.0.0"
     port: int = 8765
@@ -1159,7 +1159,7 @@ class State:
 
 class Handler(BaseHTTPRequestHandler):
     state: State
-    server_version = "mosobleirc-web"
+    server_version = "payments-web"
 
     def log_message(self, fmt, *args):
         sys.stderr.write(f"[web] {self.address_string()} {fmt % args}\n")
@@ -1265,9 +1265,9 @@ def _stop_child(child) -> None:
 
 def run_with_reloader() -> None:
     env = dict(os.environ)
-    env["MOSOBLEIRC_RELOAD_CHILD"] = "1"
+    env["PAYMENTS_RELOAD_CHILD"] = "1"
     env["PYTHONUNBUFFERED"] = "1"
-    command = [sys.executable, "-m", "mosobleirc", *sys.argv[1:]]
+    command = [sys.executable, "-m", "payments", *sys.argv[1:]]
 
     def start():
         return subprocess.Popen(command, env=env)
@@ -1306,8 +1306,8 @@ def run_with_reloader() -> None:
 
 def run_server(config: WebConfig) -> None:
     reload_enabled = (
-        os.environ.get("MOSOBLEIRC_RELOAD", "1") != "0"
-        and os.environ.get("MOSOBLEIRC_RELOAD_CHILD") != "1"
+        os.environ.get("PAYMENTS_RELOAD", "1") != "0"
+        and os.environ.get("PAYMENTS_RELOAD_CHILD") != "1"
     )
     if reload_enabled and "web" in sys.argv[1:]:
         run_with_reloader()
@@ -1320,8 +1320,8 @@ def run_server(config: WebConfig) -> None:
     except OSError as error:
         if error.errno == errno.EADDRINUSE:
             print(
-                f"Порт {config.port} уже занят. Задай другой: MOSOBLEIRC_PORT=8766 "
-                f"или python -m mosobleirc web --port 8766",
+                f"Порт {config.port} уже занят. Задай другой: PAYMENTS_PORT=8766 "
+                f"или python -m payments web --port 8766",
                 file=sys.stderr,
             )
         else:

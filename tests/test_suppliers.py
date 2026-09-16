@@ -11,8 +11,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from mosobleirc import cli  # noqa: E402
-from mosobleirc.stats import (  # noqa: E402
+from payments import cli  # noqa: E402
+from payments.stats import (  # noqa: E402
     HOUSING_GROUP,
     OTHER_GROUP,
     PARSER_VERSION,
@@ -31,8 +31,8 @@ from mosobleirc.stats import (  # noqa: E402
     scan_suppliers,
     supplier_label,
 )
-from mosobleirc.store import Store  # noqa: E402
-from mosobleirc.webapp import State, WebConfig  # noqa: E402
+from payments.store import Store  # noqa: E402
+from payments.webapp import State, WebConfig  # noqa: E402
 
 REAL_PDF = ROOT / "data/receipts/mosobleirc/2026-08.pdf"
 REAL_PDF_JULY = ROOT / "data/receipts/mosobleirc/2026-07.pdf"
@@ -637,6 +637,19 @@ class TestCli(unittest.TestCase):
         self.assertEqual(payload["months"], ["2026-08"])
         self.assertAlmostEqual(payload["grandTotal"], EXPECTED_SUM, places=2)
         self.assertEqual(payload["charges"][0]["supplier"], "mosenergosbyt")
+
+    def test_months_no_cache_still_reads_pdfs(self):
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            code = cli.main([
+                "months", "--receipts-dir", str(self.receipts), "--db", str(self.db),
+                "--no-cache", "--months", "1", "--format", "json",
+            ])
+        self.assertEqual(code, 0)
+        payload = json.loads(out.getvalue())
+        self.assertEqual(payload["months"], ["2026-08"])
+        self.assertAlmostEqual(payload["grandTotal"], EXPECTED_SUM, places=2)
+        self.assertFalse(self.db.exists())
 
     def test_months_csv(self):
         out, err = io.StringIO(), io.StringIO()
