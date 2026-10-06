@@ -31,7 +31,7 @@ from payments.stats import (  # noqa: E402
     scan_suppliers,
     supplier_label,
 )
-from payments.store import Store  # noqa: E402
+from payments.store import Store, path_key  # noqa: E402
 from payments.webapp import INDEX_HTML, State, WebConfig  # noqa: E402
 
 REAL_PDF = ROOT / "data/receipts/mosobleirc/2026-08.pdf"
@@ -152,6 +152,11 @@ class TestStore(unittest.TestCase):
         self.assertEqual(self.store.latest_month(), "2026-08")
         os.utime(pdf, (1, 1))
         self.assertIsNone(self.store.load_receipt_charges(pdf))
+
+    def test_path_keys_are_unified_for_windows_and_wsl(self):
+        self.assertEqual(path_key(r"data\receipts\upr\2026-09.pdf"), "data/receipts/upr/2026-09.pdf")
+        self.assertEqual(path_key("data/receipts/upr/2026-09.pdf"), "data/receipts/upr/2026-09.pdf")
+        self.assertEqual(path_key(self.tmp / "r.pdf"), (self.tmp / "r.pdf").as_posix())
 
     def test_disabled_store(self):
         store = Store(None)

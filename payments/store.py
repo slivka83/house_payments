@@ -35,6 +35,11 @@ CREATE INDEX IF NOT EXISTS idx_receipt_charges_service ON receipt_charges(servic
 """
 
 
+def path_key(pdf_path: Path | str) -> str:
+    """Ключ PDF в кэше: прямой слэш, чтобы кэш не дублировался при запуске из Windows и WSL."""
+    return str(pdf_path).replace("\\", "/")
+
+
 class Store:
     """SQLite-БД с результатами разбора платёжек."""
 
@@ -107,7 +112,7 @@ class Store:
             stat = pdf_path.stat()
         except OSError:
             return None
-        key = str(pdf_path)
+        key = path_key(pdf_path)
         with self._lock:
             head = conn.execute(
                 "SELECT pdf_mtime_ns, pdf_size, status, parser_version "
@@ -159,7 +164,7 @@ class Store:
             stat = pdf_path.stat()
         except OSError:
             return
-        key = str(pdf_path)
+        key = path_key(pdf_path)
         default_month = month or (str(charges[0].get("month") or "") if charges else "")
         with self._lock, conn:
             conn.execute("DELETE FROM receipt_charges WHERE path = ?", (key,))
@@ -233,7 +238,7 @@ class Store:
         conn = self._connection()
         if conn is None:
             return
-        key = str(pdf_path)
+        key = path_key(pdf_path)
         with self._lock, conn:
             conn.execute("DELETE FROM receipt_charges WHERE path = ?", (key,))
             conn.execute("DELETE FROM receipt_files WHERE path = ?", (key,))
@@ -250,7 +255,7 @@ class Store:
             stat = pdf_path.stat()
         except OSError:
             return
-        key = str(pdf_path)
+        key = path_key(pdf_path)
         with self._lock, conn:
             conn.execute("DELETE FROM receipt_charges WHERE path = ?", (key,))
             conn.execute("DELETE FROM receipt_files WHERE path = ?", (key,))
@@ -279,7 +284,8 @@ class Store:
             return 0
         with self._lock:
             existing = [row[0] for row in conn.execute("SELECT path FROM receipt_files")]
-            stale = [path for path in existing if path not in keep_paths]
+            keep = {path_key(item) for item in keep_paths}
+            stale = [path for path in existing if path not in keep]
             with conn:
                 for path in stale:
                     conn.execute("DELETE FROM receipt_charges WHERE path = ?", (path,))
